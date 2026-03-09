@@ -1,0 +1,15 @@
+---
+name: Sync Closing Labels
+on:
+- pull_request_target
+
+jobs:
+  sync:
+    permissions:
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+    - name: Sync labels with closing issues
+      uses: williambdean/closing-labels@v0.0.6
+      env:
+        GH_TOKEN: ${{ github.token }}
