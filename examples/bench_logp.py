@@ -15,6 +15,7 @@ import numpy as np
 import pymc as pm
 
 from pymc_rust_compiler.benchmark import (
+    _make_test_point,
     benchmark_logp_pytensor,
     benchmark_logp_rust,
     print_logp_comparison,
@@ -82,13 +83,14 @@ def main():
 
         model, build_dir = make_fn()
         n_evals = N_EVALS
+        x0 = _make_test_point(model)
 
         print(f"  Running {n_evals:,} logp+dlogp evaluations...")
 
-        pt_result = benchmark_logp_pytensor(model, n_evals=n_evals)
+        pt_result = benchmark_logp_pytensor(model, n_evals=n_evals, x0_model_order=x0)
         print(f"    pytensor: {pt_result['us_per_eval']:.2f} us/eval")
 
-        rs_result = benchmark_logp_rust(build_dir, model, n_evals=n_evals)
+        rs_result = benchmark_logp_rust(build_dir, model, n_evals=n_evals, x0_model_order=x0)
         if "error" in rs_result:
             print(f"    rust-ai: ERROR - {rs_result['error'][:100]}")
         else:

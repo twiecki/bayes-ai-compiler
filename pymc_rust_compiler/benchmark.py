@@ -80,7 +80,23 @@ def benchmark_rust(build_dir: str | Path, draws: int = 2000, tune: int = 1000, c
 # logp+dlogp evaluation benchmark (no sampling overhead)
 # ---------------------------------------------------------------------------
 
-def benchmark_logp_pytensor(model: pm.Model, n_evals: int = 10_000) -> dict:
+def _make_test_point(model: pm.Model, rng: np.random.Generator | None = None) -> np.ndarray:
+    """Generate a random unconstrained test point in model variable order.
+
+    Uses a random point (instead of the initial point) to avoid
+    over-specialising benchmarks on a particular parameter vector.
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+    ip = model.initial_point()
+    model_fn = model.logp_dlogp_function(ravel_inputs=True)
+    x0 = np.concatenate([np.atleast_1d(ip[v.name]) for v in model_fn._grad_vars])
+    return rng.standard_normal(x0.shape).astype(x0.dtype)
+
+
+def benchmark_logp_pytensor(
+    model: pm.Model, n_evals: int = 10_000, x0_model_order: np.ndarray | None = None,
+) -> dict:
     """Benchmark PyTensor's compiled logp+dlogp function (what nutpie calls).
 
     Calls the numba jit_fn directly to avoid Python wrapper overhead,
@@ -91,18 +107,24 @@ def benchmark_logp_pytensor(model: pm.Model, n_evals: int = 10_000) -> dict:
     logp_dlogp_fn = logp_dlogp_wrapper._pytensor_function
     logp_dlogp_fn.trust_input = True
 
-    # Build x0 ordered to match this function's _grad_vars (may differ from dict order)
     ip = model.initial_point()
     frozen_vars = [v.name for v in logp_dlogp_wrapper._grad_vars]
-    frozen_ip = {name: ip[name] for name in frozen_vars}
-    frozen_rv = DictToArrayBijection.map(frozen_ip)
-    x0 = frozen_rv.data
 
     # Build model-order point_map_info for reordering dlogp later
     model_fn = model.logp_dlogp_function(ravel_inputs=True)
-    model_rv = DictToArrayBijection.map(
-        {v.name: ip[v.name] for v in model_fn._grad_vars}
-    )
+    model_vars = [v.name for v in model_fn._grad_vars]
+
+    # Use provided x0 (model order) or generate a random one
+    if x0_model_order is None:
+        x0_model_order = _make_test_point(model)
+
+    # Reorder x0 from model order → frozen order for this function
+    model_ip = {v.name: ip[v.name] for v in model_fn._grad_vars}
+    model_rv = DictToArrayBijection.map(model_ip)
+    x0_dict = DictToArrayBijection.rmap(RaveledVars(x0_model_order, model_rv.point_map_info))
+    frozen_ip = {name: x0_dict[name] for name in frozen_vars}
+    frozen_rv = DictToArrayBijection.map(frozen_ip)
+    x0 = frozen_rv.data
 
     # Trigger numba compilation via a regular call, then grab the jit_fn
     logp_dlogp_fn(x0)
@@ -138,7 +160,10 @@ def benchmark_logp_pytensor(model: pm.Model, n_evals: int = 10_000) -> dict:
     }
 
 
-def benchmark_logp_rust(build_dir: str | Path, model: pm.Model, n_evals: int = 10_000) -> dict:
+def benchmark_logp_rust(
+    build_dir: str | Path, model: pm.Model, n_evals: int = 10_000,
+    x0_model_order: np.ndarray | None = None,
+) -> dict:
     """Benchmark the AI-compiled Rust logp+dlogp function."""
     build_dir = Path(build_dir).resolve()
     binary = build_dir / "target" / "release" / "bench"
@@ -154,11 +179,10 @@ def benchmark_logp_rust(build_dir: str | Path, model: pm.Model, n_evals: int = 1
     if result.returncode != 0:
         return {"backend": "rust-ai", "error": f"Build failed: {result.stderr[:500]}"}
 
-    # Get initial unconstrained point (Rust expects [mu, log_sigma] order)
-    logp_dlogp_fn = model.logp_dlogp_function(ravel_inputs=True)
-    logp_dlogp_fn.set_extra_values({})
-    ip = model.initial_point()
-    x0 = np.concatenate([np.atleast_1d(ip[v.name]) for v in logp_dlogp_fn._grad_vars])
+    # Use provided x0 (model order) or generate a random one
+    if x0_model_order is None:
+        x0_model_order = _make_test_point(model)
+    x0 = x0_model_order
 
     # Prepare stdin: first line = n_iters, second line = param vector
     param_str = ",".join(f"{v:.17e}" for v in x0)
