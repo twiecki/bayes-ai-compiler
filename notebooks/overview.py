@@ -286,18 +286,15 @@ def _(linreg_idata):
     az.plot_trace(linreg_idata, var_names=["alpha", "beta", "sigma"], compact=True)
     plt.tight_layout()
     plt.gcf()
-    return
+    return az, plt
 
 
 @app.cell
-def _(linreg_idata):
-    import arviz as az
-    import matplotlib.pyplot as plt
-
+def _(az, linreg_idata, plt):
     az.plot_posterior(
         linreg_idata,
         var_names=["alpha", "beta", "sigma"],
-        ref_val={"alpha": 2.5, "beta": -1.3, "sigma": 0.8},
+        ref_val=[2.5, -1.3, 0.8],
     )
     plt.tight_layout()
     plt.gcf()
@@ -364,14 +361,11 @@ def _(hierarchical_model):
 
 
 @app.cell
-def _(hier_idata):
-    import arviz as az
-    import matplotlib.pyplot as plt
-
+def _(az, hier_idata, plt):
     az.plot_posterior(
         hier_idata,
         var_names=["mu_a", "sigma_a", "b", "sigma_y"],
-        ref_val={"mu_a": 3.0, "sigma_a": 1.5, "b": -0.8, "sigma_y": 0.5},
+        ref_val=[3.0, 1.5, -0.8, 0.5],
     )
     plt.tight_layout()
     plt.gcf()
@@ -379,10 +373,7 @@ def _(hier_idata):
 
 
 @app.cell
-def _(hier_idata):
-    import arviz as az
-    import matplotlib.pyplot as plt
-
+def _(az, hier_idata, plt):
     az.plot_forest(
         hier_idata,
         var_names=["a_offset"],
