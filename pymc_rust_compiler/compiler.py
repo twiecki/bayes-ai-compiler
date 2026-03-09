@@ -75,6 +75,67 @@ HalfNormal(x | sigma) with LogTransform (unconstrained param = log_x):
   logp = log(2) - 0.5*log(2*pi) - log(sigma) - 0.5*(x/sigma)^2 + log_x
   d(logp)/d(log_x) = -x^2/sigma^2 + 1
 
+PERFORMANCE OPTIMIZATION RULES (critical for competitive speed):
+
+1. HOIST INVARIANTS OUT OF THE OBSERVATION LOOP:
+   Precompute everything that doesn't depend on the observation index BEFORE the loop.
+   ```rust
+   // GOOD: precompute once
+   let inv_sigma_sq = 1.0 / (sigma * sigma);
+   let neg_log_sigma = -sigma.ln();  // or equivalently: -log_sigma_y for log-transformed params
+   let log_norm = -0.5 * LN_2PI + neg_log_sigma;  // constant per observation
+   for i in 0..N {
+       let residual = y[i] - mu[i];
+       logp += log_norm - 0.5 * residual * residual * inv_sigma_sq;
+   }
+   // BAD: recomputing inside loop
+   for i in 0..N {
+       logp += -0.5 * LN_2PI - sigma.ln() - 0.5 * ((y[i] - mu[i]) / sigma).powi(2);
+   }
+   ```
+
+2. USE MULTIPLY INSTEAD OF DIVIDE:
+   Replace `x / sigma` with `x * inv_sigma` — division is 5-20x slower than multiplication.
+   Precompute `inv_sigma = 1.0 / sigma` and `inv_sigma_sq = inv_sigma * inv_sigma`.
+
+3. USE SEPARATE GRADIENT ACCUMULATORS FOR AUTO-VECTORIZATION:
+   LLVM can auto-vectorize (SIMD) accumulation loops when the accumulator is a simple local
+   variable, not an indexed array write. Use local f64 accumulators, then write to gradient[] once.
+   ```rust
+   let mut grad_alpha = 0.0f64;
+   let mut grad_beta = 0.0f64;
+   let mut grad_log_sigma = 0.0f64;
+   for i in 0..N {
+       let r = (y[i] - mu_i) * inv_sigma_sq;
+       grad_alpha += r;
+       grad_beta += r * x[i];
+       grad_log_sigma += r * r * sigma * sigma - 1.0;  // or equivalent
+   }
+   gradient[0] += grad_alpha;
+   gradient[1] += grad_beta;
+   gradient[2] += grad_log_sigma;
+   ```
+
+4. FOR GROUP-LEVEL GRADIENT ACCUMULATION (hierarchical models):
+   Use a local fixed-size array for group gradient accumulators instead of writing to
+   gradient[] inside the loop. This enables LLVM to keep them in registers.
+   ```rust
+   let mut grad_offset = [0.0f64; N_GROUPS];
+   for i in 0..N {
+       let g = group_idx[i] as usize;
+       grad_offset[g] += residual_scaled;
+   }
+   for g in 0..N_GROUPS {
+       gradient[OFFSET + g] += grad_offset[g] * sigma_a;
+   }
+   ```
+
+5. AVOID .powi(2) in HOT LOOPS — use `x * x` instead. The compiler may not always optimize
+   `.powi(2)` to a simple multiply.
+
+6. PRECOMPUTE LOG CONSTANTS: For log-transformed parameters, `sigma.ln()` equals `log_sigma`
+   (the unconstrained parameter). Use `log_sigma` directly instead of calling `.ln()`.
+
 DEBUGGING TIPS:
 - If logp is way off, check that you included the observed likelihood (it dominates)
 - If gradient is wrong for a sigma parameter, check N_UNCONSTRAINED vs N_CONSTRAINED
@@ -211,6 +272,9 @@ class CompilationResult:
     timings: dict[str, float]
     n_tool_calls: int = 0
     conversation_turns: int = 0
+    token_usage: dict[str, int] = field(default_factory=lambda: {
+        "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+    })
 
     @property
     def success(self) -> bool:
@@ -308,6 +372,9 @@ def compile_model(
     if verbose:
         print("\nStarting agent loop...")
 
+    total_input_tokens = 0
+    total_output_tokens = 0
+
     for turn in range(max_turns):
         # Call Claude
         t0 = time.time()
@@ -319,6 +386,13 @@ def compile_model(
             messages=state.messages,
         )
         timings[f"api_turn_{turn}"] = time.time() - t0
+
+        # Track token usage
+        if hasattr(response, "usage") and response.usage:
+            total_input_tokens += response.usage.input_tokens
+            total_output_tokens += response.usage.output_tokens
+            if verbose:
+                print(f"  Turn {turn}: {response.usage.input_tokens} in / {response.usage.output_tokens} out tokens")
 
         # Check stop reason
         if response.stop_reason == "end_turn":
@@ -378,6 +452,11 @@ def compile_model(
         timings=timings,
         n_tool_calls=state.tool_calls,
         conversation_turns=turn + 1 if 'turn' in dir() else 0,
+        token_usage={
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "total_tokens": total_input_tokens + total_output_tokens,
+        },
     )
 
 
@@ -661,6 +740,10 @@ anyhow = "1"
 [[bin]]
 name = "validate"
 path = "src/validate.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bench.rs"
 """
     (build_path / "Cargo.toml").write_text(cargo_toml)
 
@@ -715,3 +798,47 @@ fn main() {
 }
 """
     (src_dir / "validate.rs").write_text(validate_rs)
+
+    # Benchmark binary — tight loop logp+dlogp evaluations
+    bench_rs = """
+use pymc_compiled_model::generated::GeneratedLogp;
+use nuts_rs::CpuLogpFunc;
+use std::io::{self, BufRead};
+use std::time::Instant;
+
+fn main() {
+    let stdin = io::stdin();
+    let mut lines = stdin.lock().lines();
+
+    // First line: number of iterations
+    let n_iters: usize = lines.next().unwrap().unwrap().trim().parse().unwrap();
+
+    // Second line: parameter vector
+    let param_line = lines.next().unwrap().unwrap();
+    let position: Vec<f64> = param_line.split(',')
+        .map(|s| s.trim().parse().unwrap())
+        .collect();
+
+    let mut logp_fn = GeneratedLogp;
+    let n = logp_fn.dim();
+    let mut gradient = vec![0.0f64; n];
+    let mut logp_val = 0.0f64;
+
+    // Warmup
+    for _ in 0..100 {
+        logp_val = logp_fn.logp(&position, &mut gradient).unwrap();
+    }
+
+    // Timed loop
+    let start = Instant::now();
+    for _ in 0..n_iters {
+        logp_val = logp_fn.logp(&position, &mut gradient).unwrap();
+    }
+    let elapsed = start.elapsed();
+
+    let nanos = elapsed.as_nanos() as f64;
+    let us_per_eval = nanos / (n_iters as f64) / 1000.0;
+    println!("{:.6},{:.17e}", us_per_eval, logp_val);
+}
+"""
+    (src_dir / "bench.rs").write_text(bench_rs)
