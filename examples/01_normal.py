@@ -1,0 +1,53 @@
+"""Example 1: Simple Normal model — the simplest possible case.
+
+PyMC model:
+    mu ~ Normal(0, 10)
+    sigma ~ HalfNormal(5)
+    y ~ Normal(mu, sigma)  [observed]
+
+This generates ~300 lines of Rust that computes logp + gradient
+for 2 unconstrained parameters: mu and log(sigma).
+"""
+
+import numpy as np
+import pymc as pm
+
+from pymc_rust_compiler import compile_model
+
+# Generate synthetic data
+np.random.seed(42)
+true_mu, true_sigma = 5.0, 1.2
+y_obs = np.random.normal(true_mu, true_sigma, size=100)
+
+# Define PyMC model
+SOURCE = """
+mu ~ Normal(0, 10)
+sigma ~ HalfNormal(5)
+y ~ Normal(mu, sigma), observed
+"""
+
+with pm.Model() as model:
+    mu = pm.Normal("mu", mu=0, sigma=10)
+    sigma = pm.HalfNormal("sigma", sigma=5)
+    y = pm.Normal("y", mu=mu, sigma=sigma, observed=y_obs)
+
+print(f"True values: mu={true_mu}, sigma={true_sigma}")
+print(f"Data: n={len(y_obs)}, mean={y_obs.mean():.3f}, std={y_obs.std():.3f}")
+print()
+
+# Compile to Rust
+result = compile_model(
+    model,
+    source_code=SOURCE,
+    build_dir="compiled_models/normal",
+    verbose=True,
+)
+
+if result.success:
+    print(f"\nCompilation successful in {result.n_attempts} attempt(s)!")
+    print(f"Timings: {result.timings}")
+    print(f"\nGenerated Rust code saved to: compiled_models/normal/src/generated.rs")
+else:
+    print(f"\nCompilation FAILED after {result.n_attempts} attempts")
+    for err in result.validation_errors:
+        print(f"  - {err}")

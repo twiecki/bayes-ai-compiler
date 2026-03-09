@@ -1,0 +1,383 @@
+"""Extract everything from a pm.Model() needed to generate Rust logp code."""
+
+from __future__ import annotations
+
+import inspect
+import io
+import json
+import sys
+import textwrap
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import pymc as pm
+from pytensor.printing import debugprint
+
+
+@dataclass
+class ParamInfo:
+    name: str
+    value_var: str
+    transform: str | None
+    shape: list[int]
+    size: int
+
+    @property
+    def is_scalar(self) -> bool:
+        return self.size == 1
+
+
+@dataclass
+class ValidationPoint:
+    point: dict[str, list | float]
+    logp: float
+    dlogp: list[float]
+
+
+@dataclass
+class ModelContext:
+    """All information extracted from a PyMC model."""
+
+    source_code: str | None
+    params: list[ParamInfo]
+    param_order: list[str]
+    n_params: int
+    logp_graph: str
+    logp_terms: dict[str, str]
+    observed_data: dict[str, dict]
+    initial_point: ValidationPoint
+    extra_points: list[ValidationPoint]
+
+    def to_dict(self) -> dict:
+        return {
+            "source_code": self.source_code,
+            "parameters": [
+                {
+                    "name": p.name,
+                    "value_var": p.value_var,
+                    "transform": p.transform,
+                    "shape": p.shape,
+                    "size": p.size,
+                }
+                for p in self.params
+            ],
+            "param_order": self.param_order,
+            "n_params": self.n_params,
+            "logp_graph": self.logp_graph,
+            "logp_terms": self.logp_terms,
+            "observed_data": self.observed_data,
+            "validation": {
+                "initial_point": {
+                    "point": self.initial_point.point,
+                    "logp": self.initial_point.logp,
+                    "dlogp": self.initial_point.dlogp,
+                },
+                "extra_points": [
+                    {"point": p.point, "logp": p.logp, "dlogp": p.dlogp}
+                    for p in self.extra_points
+                ],
+            },
+        }
+
+    def save(self, path: str | Path):
+        with open(path, "w") as f:
+            json.dump(self.to_dict(), f, indent=2, default=str)
+
+
+class RustModelExporter:
+    """Extract everything from a pm.Model() needed for Rust code generation."""
+
+    def __init__(
+        self,
+        model: pm.Model,
+        source_code: str | None = None,
+        n_extra_points: int = 3,
+        seed: int = 123,
+    ):
+        self.model = model
+        self._source_code = source_code
+        self._n_extra_points = n_extra_points
+        self._seed = seed
+        self._context: ModelContext | None = None
+
+    @property
+    def context(self) -> ModelContext:
+        if self._context is None:
+            self._context = self._extract()
+        return self._context
+
+    def _extract(self) -> ModelContext:
+        model = self.model
+
+        params = []
+        for rv in model.free_RVs:
+            value_var = model.rvs_to_values[rv]
+            transform = model.rvs_to_transforms.get(rv, None)
+            shape = list(rv.type.shape) if hasattr(rv.type, "shape") else []
+            size = int(np.prod(shape)) if shape else 1
+            params.append(
+                ParamInfo(
+                    name=rv.name,
+                    value_var=value_var.name,
+                    transform=type(transform).__name__ if transform else None,
+                    shape=shape,
+                    size=size,
+                )
+            )
+
+        param_order = [v.name for v in model.value_vars]
+        n_params = sum(p.size for p in params)
+
+        logp_graph = _capture_debugprint(model.logp())
+
+        logp_terms = {}
+        for rv in model.free_RVs:
+            term = model.logp(vars=[rv], sum=False)
+            logp_terms[rv.name] = _capture_debugprint(term)
+        for rv in model.observed_RVs:
+            term = model.logp(vars=[rv], sum=False)
+            logp_terms[rv.name] = _capture_debugprint(term)
+
+        observed_data = {}
+        for rv in model.observed_RVs:
+            obs = model.rvs_to_values[rv]
+            # PyMC 5: TensorConstant has .data, SharedVariable has .get_value()
+            if hasattr(obs, "data"):
+                data = np.asarray(obs.data)
+            elif hasattr(obs, "get_value"):
+                data = obs.get_value()
+            else:
+                data = None
+            if data is not None:
+                observed_data[rv.name] = {
+                    "shape": list(data.shape),
+                    "dtype": str(data.dtype),
+                    "n": int(np.prod(data.shape)),
+                    "min": float(np.min(data)),
+                    "max": float(np.max(data)),
+                    "mean": float(np.mean(data)),
+                    "values": data.tolist(),
+                }
+            else:
+                observed_data[rv.name] = {"shape": "unknown"}
+
+        logp_fn = model.compile_logp()
+        dlogp_fn = model.compile_dlogp()
+        test_point = model.initial_point()
+
+        initial = ValidationPoint(
+            point={
+                k: v.tolist() if hasattr(v, "tolist") else v
+                for k, v in test_point.items()
+            },
+            logp=float(logp_fn(test_point)),
+            dlogp=dlogp_fn(test_point).tolist(),
+        )
+
+        rng = np.random.default_rng(self._seed)
+        extra_points = []
+        for _ in range(self._n_extra_points):
+            point = {}
+            for k, v in test_point.items():
+                if hasattr(v, "shape") and v.shape:
+                    point[k] = (rng.standard_normal(v.shape) * 0.5).tolist()
+                else:
+                    point[k] = float(rng.standard_normal() * 0.5)
+            extra_points.append(
+                ValidationPoint(
+                    point=point,
+                    logp=float(logp_fn(point)),
+                    dlogp=dlogp_fn(point).tolist(),
+                )
+            )
+
+        source = self._source_code or self._try_extract_source()
+
+        return ModelContext(
+            source_code=source,
+            params=params,
+            param_order=param_order,
+            n_params=n_params,
+            logp_graph=logp_graph,
+            logp_terms=logp_terms,
+            observed_data=observed_data,
+            initial_point=initial,
+            extra_points=extra_points,
+        )
+
+    def _try_extract_source(self) -> str | None:
+        try:
+            for frame_info in inspect.stack():
+                source = inspect.getsource(frame_info.frame)
+                if "pm.Model" in source or "pymc.Model" in source:
+                    return textwrap.dedent(source)
+        except (OSError, TypeError):
+            pass
+        return None
+
+    def to_prompt(self) -> str:
+        """Generate a complete LLM prompt for Rust code generation."""
+        ctx = self.context
+        parts = []
+
+        parts.append("Generate a Rust logp+gradient function for this PyMC model.\n")
+
+        if ctx.source_code:
+            parts.append(f"## PyMC Model Code\n```python\n{ctx.source_code}\n```\n")
+
+        parts.append("## Parameter Layout (unconstrained space)")
+        parts.append("The `position` slice contains these parameters in order:\n")
+        offset = 0
+        for p in ctx.params:
+            if p.is_scalar:
+                line = f"- position[{offset}] = {p.value_var}"
+            else:
+                line = f"- position[{offset}..{offset + p.size}] = {p.value_var} (shape {p.shape})"
+            if p.transform:
+                line += f"  [{p.transform} of {p.name}]"
+            parts.append(line)
+            offset += p.size
+        parts.append(f"\nTotal unconstrained parameters: {ctx.n_params}\n")
+
+        if ctx.observed_data:
+            parts.append("## Observed Data\n")
+            parts.append("IMPORTANT: You MUST embed this data as const arrays in your Rust code.\n")
+            for name, info in ctx.observed_data.items():
+                mn = info.get("min")
+                mx = info.get("max")
+                mean = info.get("mean")
+                range_str = f"[{mn:.3f}, {mx:.3f}]" if mn is not None else "unknown"
+                mean_str = f"{mean:.3f}" if mean is not None else "unknown"
+                parts.append(
+                    f"- {name}: shape={info.get('shape')}, dtype={info.get('dtype')}, "
+                    f"n={info.get('n')}, range={range_str}, mean={mean_str}"
+                )
+                # Include actual data values with full precision
+                values = info.get("values")
+                if values is not None:
+                    if isinstance(values[0], list):
+                        for dim_name, dim_vals in enumerate(values):
+                            parts.append(f"\n{name}[{dim_name}] values: {dim_vals}")
+                    else:
+                        # Full precision to avoid rounding errors
+                        formatted = ",\n    ".join(f"{v:.17e}" for v in values)
+                        parts.append(
+                            f"\nIMPORTANT: Copy these values EXACTLY (do NOT round or modify):"
+                            f"\n```rust\nconst {name.upper()}_DATA: &[f64] = &[\n    {formatted}\n];\n```"
+                        )
+            parts.append("")
+
+        parts.append(f"## PyTensor Computational Graph (logp)\n```\n{ctx.logp_graph}\n```\n")
+
+        parts.append("## Individual logp terms\n")
+        for name, term in ctx.logp_terms.items():
+            display = term[:2000] + ("..." if len(term) > 2000 else "")
+            parts.append(f"### {name}\n```\n{display}\n```\n")
+
+        parts.append("## Validation")
+        parts.append("Your generated code MUST produce these exact values (within float64 precision):\n")
+
+        parts.append(f"At initial point: {json.dumps(ctx.initial_point.point)}")
+        parts.append(f"- logp = {ctx.initial_point.logp:.10f}")
+        parts.append(f"- gradient = {ctx.initial_point.dlogp}\n")
+
+        for i, pt in enumerate(ctx.extra_points):
+            parts.append(f"At test point {i + 1}: {json.dumps(pt.point)}")
+            parts.append(f"- logp = {pt.logp:.10f}")
+            parts.append(f"- gradient = {pt.dlogp}\n")
+
+        parts.append("""## Output
+Generate ONLY the Rust function body. Include comments mapping each section
+to the corresponding PyMC variable. The function signature is:
+```rust
+fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> Result<f64, SampleError>
+```""")
+
+        return "\n".join(parts)
+
+    def to_context(self) -> dict:
+        return self.context.to_dict()
+
+    def to_rust_tests(self, struct_name: str = "GeneratedLogp") -> str:
+        """Generate Rust test code that validates logp+gradient at known points."""
+        ctx = self.context
+        tests = []
+
+        tests.append("""
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(a: f64, b: f64, tol: f64, name: &str) {
+        let diff = (a - b).abs();
+        assert!(diff < tol, "{}: expected {}, got {}, diff={}", name, b, a, diff);
+    }
+""")
+
+        all_points = [("initial_point", ctx.initial_point)] + [
+            (f"point_{i + 1}", p) for i, p in enumerate(ctx.extra_points)
+        ]
+
+        for test_name, vp in all_points:
+            position = []
+            for name in ctx.param_order:
+                val = vp.point[name]
+                if isinstance(val, list):
+                    position.extend(val)
+                else:
+                    position.append(val)
+
+            tests.append(f"""
+    #[test]
+    fn test_logp_at_{test_name}() {{
+        let mut logp_fn = {struct_name};
+        let position = vec!{position};
+        let mut gradient = vec![0.0f64; {ctx.n_params}];
+        let logp = logp_fn.logp(&position, &mut gradient).unwrap();
+
+        assert_close(logp, {vp.logp:.10f}, 1e-6, "logp");""")
+
+            for i, g in enumerate(vp.dlogp):
+                tests.append(
+                    f'        assert_close(gradient[{i}], {g:.10e}, 1e-4, "grad[{i}]");'
+                )
+            tests.append("    }\n")
+
+        tests.append("}\n")
+        return "\n".join(tests)
+
+    def save_all(self, output_dir: str | Path):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "codegen_prompt.txt").write_text(self.to_prompt())
+        self.context.save(output_dir / "codegen_context.json")
+        (output_dir / "validation_test.rs").write_text(self.to_rust_tests())
+
+
+def _capture_debugprint(var) -> str:
+    old_stdout = sys.stdout
+    sys.stdout = buffer = io.StringIO()
+    debugprint(var, print_type=True)
+    sys.stdout = old_stdout
+    return buffer.getvalue()
+
+
+def export_model(
+    model: pm.Model,
+    source_code: str | None = None,
+    output_dir: str | Path | None = None,
+    n_extra_points: int = 3,
+) -> RustModelExporter:
+    """One-liner to export a PyMC model for Rust compilation.
+
+    Usage:
+        exporter = export_model(model)
+        prompt = exporter.to_prompt()
+    """
+    exporter = RustModelExporter(
+        model, source_code=source_code, n_extra_points=n_extra_points
+    )
+    if output_dir:
+        exporter.save_all(output_dir)
+    return exporter
