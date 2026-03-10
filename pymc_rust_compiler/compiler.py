@@ -27,6 +27,8 @@ import pymc as pm
 
 from pymc_rust_compiler.exporter import RustModelExporter
 
+_SKILLS_DIR = Path(__file__).parent / "skills"
+
 
 SYSTEM_PROMPT = """You are an expert Rust code generator for Bayesian statistical models.
 
@@ -135,6 +137,21 @@ PERFORMANCE OPTIMIZATION RULES (critical for competitive speed):
 
 6. PRECOMPUTE LOG CONSTANTS: For log-transformed parameters, `sigma.ln()` equals `log_sigma`
    (the unconstrained parameter). Use `log_sigma` directly instead of calling `.ln()`.
+
+7. PRE-ALLOCATE SCRATCH ARRAYS IN THE STRUCT (zero allocation in logp):
+   Any arrays needed during logp evaluation should be stored as fields in `GeneratedLogp`
+   and initialized once in `GeneratedLogp::new()`. NEVER use `vec![]` or `Vec::new()` inside
+   `logp()` — heap allocation per call destroys performance. Use stack-allocated fixed arrays
+   `[0.0; N]` for small sizes (< 64 elements) or struct fields for larger ones.
+   ```rust
+   pub struct GeneratedLogp {
+       scratch: Vec<f64>,  // reused across calls
+   }
+   impl GeneratedLogp {
+       pub fn new() -> Self { Self { scratch: vec![0.0; N] } }
+   }
+   // In logp(): just zero and reuse self.scratch
+   ```
 
 DEBUGGING TIPS:
 - If logp is way off, check that you included the observed likelihood (it dominates)
@@ -260,6 +277,59 @@ TOOLS = [
 ]
 
 
+def _detect_skills(model: pm.Model, ctx) -> list[str]:
+    """Detect which skills are needed based on model structure.
+
+    Returns a list of skill names (matching filenames in skills/).
+    """
+    skills = []
+
+    # GP: detect MvNormal or gp_ variables in the model
+    for rv in list(model.free_RVs) + list(model.observed_RVs):
+        op_name = type(rv.owner.op).__name__ if rv.owner else ""
+        if "MvNormal" in op_name or "GP" in op_name:
+            skills.append("gp")
+            break
+    # Also check the logp graph text for GP indicators
+    if "gp" not in skills and any(
+        kw in ctx.logp_graph.lower()
+        for kw in ["cholesky", "mvnormal", "gp_"]
+    ):
+        skills.append("gp")
+
+    # ZeroSumNormal: detect ZeroSumTransform
+    for p in ctx.params:
+        if p.transform == "ZeroSumTransform":
+            skills.append("zerosumnormal")
+            break
+
+    return skills
+
+
+def _load_skill(name: str) -> str:
+    """Load a skill file by name."""
+    path = _SKILLS_DIR / f"{name}.md"
+    if not path.exists():
+        return ""
+    return path.read_text()
+
+
+def _build_system_prompt(skills: list[str]) -> str:
+    """Build system prompt with optional skill augmentation."""
+    prompt = SYSTEM_PROMPT
+    for skill_name in skills:
+        content = _load_skill(skill_name)
+        if content:
+            prompt += f"\n\n{'='*60}\n{content}"
+    return prompt
+
+
+# Extra Cargo.toml dependencies needed per skill
+_SKILL_CARGO_DEPS: dict[str, dict[str, str]] = {
+    "gp": {"faer": "0.24"},
+}
+
+
 @dataclass
 class CompilationResult:
     """Result of compiling a PyMC model to Rust."""
@@ -341,6 +411,17 @@ def compile_model(
     if verbose:
         print(f"  {ctx.n_params} parameters, {len(prompt)} char prompt")
 
+    # Detect model-specific skills and build augmented system prompt
+    skills = _detect_skills(model, ctx)
+    system_prompt = _build_system_prompt(skills)
+    if verbose and skills:
+        print(f"  Skills loaded: {', '.join(skills)}")
+
+    # Collect extra Cargo dependencies from skills
+    extra_deps: dict[str, str] = {}
+    for skill_name in skills:
+        extra_deps.update(_SKILL_CARGO_DEPS.get(skill_name, {}))
+
     # Step 2: Set up build directory and write data
     if build_dir:
         build_path = Path(build_dir)
@@ -348,7 +429,7 @@ def compile_model(
     else:
         build_path = Path(tempfile.mkdtemp(prefix="pymc_rust_"))
 
-    _setup_rust_project(build_path, ctx)
+    _setup_rust_project(build_path, ctx, extra_cargo_deps=extra_deps)
 
     if verbose:
         print(f"  Build dir: {build_path}")
@@ -381,7 +462,7 @@ def compile_model(
         response = client.messages.create(
             model=model_name,
             max_tokens=16384,
-            system=SYSTEM_PROMPT,
+            system=system_prompt,
             tools=TOOLS,
             messages=state.messages,
         )
@@ -720,22 +801,31 @@ def _generate_data_rs(ctx) -> str:
     return "\n".join(lines)
 
 
-def _setup_rust_project(build_path: Path, ctx):
+def _setup_rust_project(
+    build_path: Path, ctx, extra_cargo_deps: dict[str, str] | None = None,
+):
     """Create the Rust project structure with pre-generated data."""
     src_dir = build_path / "src"
     src_dir.mkdir(parents=True, exist_ok=True)
 
-    cargo_toml = """[package]
+    deps_lines = [
+        'nuts-rs = "0.17"',
+        'nuts-storable = "0.2"',
+        'rand = "0.10"',
+        'thiserror = "2"',
+        'anyhow = "1"',
+    ]
+    for dep_name, dep_version in (extra_cargo_deps or {}).items():
+        deps_lines.append(f'{dep_name} = "{dep_version}"')
+
+    deps_block = "\n".join(deps_lines)
+    cargo_toml = f"""[package]
 name = "pymc-compiled-model"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-nuts-rs = "0.17"
-nuts-storable = "0.2"
-rand = "0.10"
-thiserror = "2"
-anyhow = "1"
+{deps_block}
 
 [[bin]]
 name = "validate"
