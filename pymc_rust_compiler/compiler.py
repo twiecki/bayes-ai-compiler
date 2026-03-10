@@ -13,6 +13,7 @@ model compiles and validates correctly.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -26,6 +27,8 @@ import numpy as np
 import pymc as pm
 
 from pymc_rust_compiler.exporter import RustModelExporter
+
+_SKILLS_DIR = Path(__file__).parent / "skills"
 
 
 SYSTEM_PROMPT = """You are an expert Rust code generator for Bayesian statistical models.
@@ -136,7 +139,27 @@ PERFORMANCE OPTIMIZATION RULES (critical for competitive speed):
 6. PRECOMPUTE LOG CONSTANTS: For log-transformed parameters, `sigma.ln()` equals `log_sigma`
    (the unconstrained parameter). Use `log_sigma` directly instead of calling `.ln()`.
 
+7. PRE-ALLOCATE SCRATCH ARRAYS IN THE STRUCT (zero allocation in logp):
+   Any arrays needed during logp evaluation should be stored as fields in `GeneratedLogp`
+   and reused across calls. NEVER use `vec![]` or `Vec::new()` inside `logp()` — heap
+   allocation per call destroys performance. Use stack-allocated fixed arrays `[0.0; N]`
+   for small sizes (< 64 elements) or struct fields for larger ones.
+   When using struct fields, implement Default:
+   ```rust
+   pub struct GeneratedLogp {
+       scratch: Vec<f64>,  // reused across calls
+   }
+   impl Default for GeneratedLogp {
+       fn default() -> Self { Self { scratch: vec![0.0; N] } }
+   }
+   // The validate/bench binaries call GeneratedLogp::default()
+   // In logp(): just zero self.scratch and reuse it
+   ```
+   For simple models with no heap-allocated scratch, use `#[derive(Clone, Default)]`.
+
 DEBUGGING TIPS:
+- IMPORTANT: Define `const LN_2PI: f64 = 1.8378770664093453;` (this is ln(2π)).
+  Do NOT compute it as `LN_2 * PI` — that gives ln(2)*π ≈ 2.177, which is WRONG.
 - If logp is way off, check that you included the observed likelihood (it dominates)
 - If gradient is wrong for a sigma parameter, check N_UNCONSTRAINED vs N_CONSTRAINED
 - Use `read_file` to inspect data.rs to confirm array names and sizes
@@ -168,7 +191,7 @@ pub struct Draw {
     pub parameters: Vec<f64>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct GeneratedLogp;
 
 impl HasDims for GeneratedLogp {
@@ -260,6 +283,60 @@ TOOLS = [
 ]
 
 
+def _detect_skills(model: pm.Model, ctx) -> list[str]:
+    """Detect which skills are needed based on model structure.
+
+    Returns a list of skill names (matching filenames in skills/).
+    """
+    skills = []
+
+    # GP: detect MvNormal or gp_ variables in the model
+    for rv in list(model.free_RVs) + list(model.observed_RVs):
+        op_name = type(rv.owner.op).__name__ if rv.owner else ""
+        if "MvNormal" in op_name or "GP" in op_name:
+            skills.append("gp")
+            break
+    # Also check the logp graph text for GP indicators
+    if "gp" not in skills and any(
+        kw in ctx.logp_graph.lower()
+        for kw in ["cholesky", "mvnormal", "gp_"]
+    ):
+        skills.append("gp")
+
+    # ZeroSumNormal: detect ZeroSumTransform
+    for p in ctx.params:
+        if p.transform == "ZeroSumTransform":
+            skills.append("zerosumnormal")
+            break
+
+    return skills
+
+
+@functools.lru_cache(maxsize=None)
+def _load_skill(name: str) -> str:
+    """Load a skill file by name (cached after first read)."""
+    path = _SKILLS_DIR / f"{name}.md"
+    if not path.exists():
+        return ""
+    return path.read_text()
+
+
+def _build_system_prompt(skills: list[str]) -> str:
+    """Build system prompt with optional skill augmentation."""
+    prompt = SYSTEM_PROMPT
+    for skill_name in skills:
+        content = _load_skill(skill_name)
+        if content:
+            prompt += f"\n\n{'='*60}\n{content}"
+    return prompt
+
+
+# Extra Cargo.toml dependencies needed per skill
+_SKILL_CARGO_DEPS: dict[str, dict[str, str]] = {
+    "gp": {"faer": "0.24"},
+}
+
+
 @dataclass
 class CompilationResult:
     """Result of compiling a PyMC model to Rust."""
@@ -341,6 +418,17 @@ def compile_model(
     if verbose:
         print(f"  {ctx.n_params} parameters, {len(prompt)} char prompt")
 
+    # Detect model-specific skills and build augmented system prompt
+    skills = _detect_skills(model, ctx)
+    system_prompt = _build_system_prompt(skills)
+    if verbose and skills:
+        print(f"  Skills loaded: {', '.join(skills)}")
+
+    # Collect extra Cargo dependencies from skills
+    extra_deps: dict[str, str] = {}
+    for skill_name in skills:
+        extra_deps.update(_SKILL_CARGO_DEPS.get(skill_name, {}))
+
     # Step 2: Set up build directory and write data
     if build_dir:
         build_path = Path(build_dir)
@@ -348,7 +436,7 @@ def compile_model(
     else:
         build_path = Path(tempfile.mkdtemp(prefix="pymc_rust_"))
 
-    _setup_rust_project(build_path, ctx)
+    _setup_rust_project(build_path, ctx, extra_cargo_deps=extra_deps)
 
     if verbose:
         print(f"  Build dir: {build_path}")
@@ -374,6 +462,7 @@ def compile_model(
 
     total_input_tokens = 0
     total_output_tokens = 0
+    turn = 0
 
     for turn in range(max_turns):
         # Call Claude
@@ -381,7 +470,7 @@ def compile_model(
         response = client.messages.create(
             model=model_name,
             max_tokens=16384,
-            system=SYSTEM_PROMPT,
+            system=system_prompt,
             tools=TOOLS,
             messages=state.messages,
         )
@@ -451,7 +540,7 @@ def compile_model(
         build_dir=build_path,
         timings=timings,
         n_tool_calls=state.tool_calls,
-        conversation_turns=turn + 1 if 'turn' in dir() else 0,
+        conversation_turns=turn + 1,
         token_usage={
             "input_tokens": total_input_tokens,
             "output_tokens": total_output_tokens,
@@ -535,22 +624,12 @@ def _tool_validate_logp(state: _AgentState, verbose: bool) -> str:
         (f"extra_{i}", p) for i, p in enumerate(ctx.extra_points)
     ]
 
-    def _flatten(v):
-        if isinstance(v, (list, tuple)):
-            for item in v:
-                yield from _flatten(item)
-        elif hasattr(v, '__iter__') and not isinstance(v, str):
-            for item in v:
-                yield from _flatten(item)
-        else:
-            yield float(v)
-
     input_lines = []
     for name, vp in all_points:
         position = []
         for param_name in ctx.param_order:
             val = vp.point[param_name]
-            position.extend(_flatten(val))
+            position.extend(np.asarray(val, dtype=np.float64).ravel())
         input_lines.append(",".join(f"{v:.17e}" for v in position))
 
     stdin_data = "\n".join(input_lines) + "\n"
@@ -672,9 +751,15 @@ def _tool_read_file(
     if not file_path.exists():
         # List available files
         available = []
-        for f in state.build_path.rglob("*"):
-            if f.is_file() and "target" not in f.parts:
-                available.append(str(f.relative_to(state.build_path)))
+        # List root-level files and src/ contents (skip target/ which can be huge)
+        for f in state.build_path.iterdir():
+            if f.is_file():
+                available.append(f.name)
+        src = state.build_path / "src"
+        if src.exists():
+            for f in src.rglob("*"):
+                if f.is_file():
+                    available.append(str(f.relative_to(state.build_path)))
         return f"File not found: {rel_path}\nAvailable files: {', '.join(available)}"
 
     content = file_path.read_text()
@@ -720,22 +805,31 @@ def _generate_data_rs(ctx) -> str:
     return "\n".join(lines)
 
 
-def _setup_rust_project(build_path: Path, ctx):
+def _setup_rust_project(
+    build_path: Path, ctx, extra_cargo_deps: dict[str, str] | None = None,
+):
     """Create the Rust project structure with pre-generated data."""
     src_dir = build_path / "src"
     src_dir.mkdir(parents=True, exist_ok=True)
 
-    cargo_toml = """[package]
+    deps_lines = [
+        'nuts-rs = "0.17"',
+        'nuts-storable = "0.2"',
+        'rand = "0.10"',
+        'thiserror = "2"',
+        'anyhow = "1"',
+    ]
+    for dep_name, dep_version in (extra_cargo_deps or {}).items():
+        deps_lines.append(f'{dep_name} = "{dep_version}"')
+
+    deps_block = "\n".join(deps_lines)
+    cargo_toml = f"""[package]
 name = "pymc-compiled-model"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-nuts-rs = "0.17"
-nuts-storable = "0.2"
-rand = "0.10"
-thiserror = "2"
-anyhow = "1"
+{deps_block}
 
 [[bin]]
 name = "validate"
@@ -763,7 +857,7 @@ path = "src/bench.rs"
             _np.save(build_path / f"{name}_data.npy", _np.asarray(values))
 
     # lib.rs to expose modules
-    lib_rs = "pub mod data;\npub mod generated;\n"
+    lib_rs = "pub mod data;\npub mod generated;\npub use generated::*;\n"
     (src_dir / "lib.rs").write_text(lib_rs)
 
     # Placeholder generated.rs so the project structure is valid
@@ -778,7 +872,7 @@ use nuts_rs::CpuLogpFunc;
 use std::io::{self, BufRead, Write};
 
 fn main() {
-    let mut logp_fn = GeneratedLogp;
+    let mut logp_fn = GeneratedLogp::default();
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -830,7 +924,7 @@ fn main() {
         .map(|s| s.trim().parse().unwrap())
         .collect();
 
-    let mut logp_fn = GeneratedLogp;
+    let mut logp_fn = GeneratedLogp::default();
     let n = logp_fn.dim();
     let mut gradient = vec![0.0f64; n];
     let mut logp_val = 0.0f64;
@@ -849,7 +943,11 @@ fn main() {
 
     let nanos = elapsed.as_nanos() as f64;
     let us_per_eval = nanos / (n_iters as f64) / 1000.0;
-    println!("{:.6},{:.17e}", us_per_eval, logp_val);
+    print!("{:.6},{:.17e}", us_per_eval, logp_val);
+    for g in &gradient {
+        print!(",{:.17e}", g);
+    }
+    println!();
 }
 """
     (src_dir / "bench.rs").write_text(bench_rs)
