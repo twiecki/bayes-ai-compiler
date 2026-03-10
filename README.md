@@ -38,7 +38,7 @@ Hardware is auto-detected: CUDA → MLX → CPU fallback.
 
 Rust vs nutpie's Numba backend (500K evaluations, lower is better):
 
-| Model | Numba (us/eval) | Rust (us/eval) | Speedup |
+| Model | Numba (µs/eval) | Rust (µs/eval) | Speedup |
 |---|---|---|---|
 | Normal (2 params) | 0.96 | 0.14 | **6.8x** |
 | LinReg (3 params) | 1.60 | 0.33 | **4.9x** |
@@ -46,6 +46,17 @@ Rust vs nutpie's Numba backend (500K evaluations, lower is better):
 | GP regression (3 params) | 116.57 | 35.31 | **3.3x** |
 
 Numba column = `numba.cfunc` called from Rust in a tight loop (how nutpie actually works). The AI-compiled Rust is 3-7x faster across all models.
+
+### MLX (Apple Silicon GPU) acceleration
+
+For GP models on Apple Silicon (M1-M5), the compiler auto-detects Metal support and uses `mlx-rs` for GPU-accelerated Cholesky, triangular solves, and matrix inverse. Benchmarks on M4 Max, N=200 GP:
+
+| Backend | µs/eval | Speedup vs Numba |
+|---|---|---|
+| PyTensor (Numba) | 749 | 1.0x |
+| Rust + MLX (Metal GPU) | 511 | **1.47x** |
+
+The GPU advantage grows with matrix size — for larger GPs (N>500), MLX offloads the O(N³) Cholesky to Metal while keeping kernel construction and gradients on CPU.
 
 ## Quick start
 
