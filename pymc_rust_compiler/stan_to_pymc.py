@@ -187,11 +187,12 @@ def _load_skill(name: str) -> str:
 
 
 def _build_system_prompt() -> str:
-    """Build system prompt with Stan→PyMC skill."""
+    """Build system prompt with Stan→PyMC and optimization skills."""
     prompt = SYSTEM_PROMPT
-    content = _load_skill("stan_to_pymc")
-    if content:
-        prompt += f"\n\n{'='*60}\n{content}"
+    for skill_name in ("stan_to_pymc", "pymc_optimization"):
+        content = _load_skill(skill_name)
+        if content:
+            prompt += f"\n\n{'='*60}\n{content}"
     return prompt
 
 
