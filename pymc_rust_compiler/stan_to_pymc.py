@@ -498,10 +498,14 @@ def _tool_validate_model(state: _AgentState, verbose: bool) -> str:
     # Build the report
     report_lines = []
     errors = []
+    eval_errors = []
 
-    # Evaluate at each reference point
-    # The tricky part: BridgeStan and PyMC may order unconstrained params differently.
-    # We'll try to evaluate PyMC's logp at its own initial point first, then compare.
+    # Evaluate logp at each reference point and collect results.
+    # Instead of comparing absolute logp values, we check whether the
+    # difference (BridgeStan logp - PyMC logp) is constant across all
+    # points. A constant offset means the models differ only by a
+    # normalization constant, which does not affect the posterior.
+    point_results = []  # list of (label, ref_logp, pymc_logp)
 
     for i, ref in enumerate(state.reference_points):
         label = "initial (all zeros)" if i == 0 else f"test point {i}"
@@ -514,7 +518,7 @@ def _tool_validate_model(state: _AgentState, verbose: bool) -> str:
             )
         except Exception as e:
             report_lines.append(f"{label}: ERROR mapping point: {e}")
-            errors.append(f"{label}: point mapping error: {e}")
+            eval_errors.append(f"{label}: point mapping error: {e}")
             continue
 
         # Evaluate logp
@@ -523,13 +527,60 @@ def _tool_validate_model(state: _AgentState, verbose: bool) -> str:
             pymc_logp = float(pymc_logp)
         except Exception as e:
             report_lines.append(f"{label}: ERROR evaluating logp: {e}")
-            errors.append(f"{label}: logp evaluation error: {e}")
+            eval_errors.append(f"{label}: logp evaluation error: {e}")
             continue
 
         ref_logp = ref["logp"]
+        point_results.append((label, ref_logp, pymc_logp))
+
+    # --- Validation logic: offset-tolerant comparison ---
+    # If we have at least 2 successfully evaluated points, check whether
+    # the logp differences are consistent (constant offset).  If only 1
+    # point evaluated successfully, fall back to direct comparison.
+
+    if len(point_results) >= 2:
+        diffs = [ref - pymc for _, ref, pymc in point_results]
+        mean_diff = sum(diffs) / len(diffs)
+
+        for label, ref_logp, pymc_logp in point_results:
+            diff = ref_logp - pymc_logp
+            # How much does this diff deviate from the mean diff?
+            offset_dev = abs(diff - mean_diff)
+            # Relative deviation: how large is the inconsistency compared
+            # to the logp magnitude?
+            scale = max(abs(ref_logp), 1.0)
+            rel_dev = offset_dev / scale
+
+            rel_err = abs(pymc_logp - ref_logp) / scale
+            if rel_err <= 1e-2:
+                status = "OK"
+            elif rel_dev <= 1e-2:
+                status = "OK (constant offset)"
+            else:
+                status = "MISMATCH"
+
+            report_lines.append(
+                f"{label}: logp BridgeStan={ref_logp:.6f} PyMC={pymc_logp:.6f} "
+                f"diff={diff:.6f} rel_err={rel_err:.2e} "
+                f"offset_dev={rel_dev:.2e} [{status}]"
+            )
+            if status == "MISMATCH":
+                errors.append(
+                    f"{label}: logp mismatch: BridgeStan={ref_logp:.6f}, "
+                    f"PyMC={pymc_logp:.6f}, rel_err={rel_err:.2e}, "
+                    f"offset_dev={rel_dev:.2e} (not a constant offset)"
+                )
+
+        if not errors and abs(mean_diff) > 1e-6:
+            report_lines.append(
+                f"\nNote: constant logp offset of {mean_diff:.6f} detected "
+                f"(normalization constant difference — does not affect posterior)"
+            )
+    elif len(point_results) == 1:
+        # Only one point: fall back to direct comparison
+        label, ref_logp, pymc_logp = point_results[0]
         rel_err = abs(pymc_logp - ref_logp) / max(abs(ref_logp), 1.0)
         status = "OK" if rel_err <= 1e-2 else "MISMATCH"
-
         report_lines.append(
             f"{label}: logp BridgeStan={ref_logp:.6f} PyMC={pymc_logp:.6f} "
             f"rel_err={rel_err:.2e} [{status}]"
@@ -539,6 +590,9 @@ def _tool_validate_model(state: _AgentState, verbose: bool) -> str:
                 f"{label}: logp mismatch: BridgeStan={ref_logp:.6f}, "
                 f"PyMC={pymc_logp:.6f}, rel_err={rel_err:.2e}"
             )
+
+    # Include any evaluation errors as validation errors
+    errors.extend(eval_errors)
 
     report = "\n".join(report_lines)
 
@@ -561,7 +615,7 @@ def _tool_validate_model(state: _AgentState, verbose: bool) -> str:
             "- Check for missing Jacobian terms (PyMC handles these automatically "
             "for built-in transforms, but custom Potentials may need manual adjustment)\n"
             "- BridgeStan uses propto=True, so constant terms may differ — "
-            "a relative error up to 1e-2 is acceptable\n"
+            "a constant offset in logp is acceptable as it does not affect the posterior\n"
             f"\nPyMC model variables (unconstrained): {unc_var_names}\n"
             f"BridgeStan parameter names: {state.unc_param_names}"
         )
