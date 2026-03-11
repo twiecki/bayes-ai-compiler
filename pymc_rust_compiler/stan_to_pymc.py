@@ -517,10 +517,14 @@ def _tool_validate_model(state: _AgentState, verbose: bool) -> str:
     # Build the report
     report_lines = []
     errors = []
+    eval_errors = []
 
-    # Evaluate at each reference point
-    # The tricky part: BridgeStan and PyMC may order unconstrained params differently.
-    # We'll try to evaluate PyMC's logp at its own initial point first, then compare.
+    # Evaluate logp at each reference point and collect results.
+    # Instead of comparing absolute logp values, we check whether the
+    # difference (BridgeStan logp - PyMC logp) is constant across all
+    # points. A constant offset means the models differ only by a
+    # normalization constant, which does not affect the posterior.
+    point_results = []  # list of (label, ref_logp, pymc_logp)
 
     for i, ref in enumerate(state.reference_points):
         label = "initial (all zeros)" if i == 0 else f"test point {i}"
@@ -533,7 +537,7 @@ def _tool_validate_model(state: _AgentState, verbose: bool) -> str:
             )
         except Exception as e:
             report_lines.append(f"{label}: ERROR mapping point: {e}")
-            errors.append(f"{label}: point mapping error: {e}")
+            eval_errors.append(f"{label}: point mapping error: {e}")
             continue
 
         # Evaluate logp
@@ -542,19 +546,68 @@ def _tool_validate_model(state: _AgentState, verbose: bool) -> str:
             pymc_logp = float(pymc_logp)
         except Exception as e:
             report_lines.append(f"{label}: ERROR evaluating logp: {e}")
-            errors.append(f"{label}: logp evaluation error: {e}")
+            eval_errors.append(f"{label}: logp evaluation error: {e}")
             continue
 
         ref_logp = ref["logp"]
-        # Apply Half* correction: subtract log(2) per Half* distribution
+        # Apply Half* correction first: subtract log(2) per Half* distribution
         # to match Stan's convention of not normalizing symmetric priors
         # on lower-bounded parameters.
         corrected_logp = pymc_logp - half_logp_correction
-        rel_err = abs(corrected_logp - ref_logp) / max(abs(ref_logp), 1.0)
-        status = "OK" if rel_err <= 1e-2 else "MISMATCH"
+        point_results.append((label, ref_logp, corrected_logp))
+
+    # --- Validation logic: offset-tolerant comparison ---
+    # First apply the known Half* log(2) correction, then check whether
+    # any remaining difference is a constant offset across all points
+    # (indicating a normalization constant difference that doesn't affect
+    # the posterior).
+
+    if len(point_results) >= 2:
+        diffs = [ref - pymc for _, ref, pymc in point_results]
+        mean_diff = sum(diffs) / len(diffs)
 
         correction_note = (
-            f" (corrected from {pymc_logp:.6f}, {n_half} Half* dists)"
+            f" (Half* corrected, {n_half} dists)"
+            if n_half > 0 else ""
+        )
+
+        for label, ref_logp, corrected_logp in point_results:
+            diff = ref_logp - corrected_logp
+            offset_dev = abs(diff - mean_diff)
+            scale = max(abs(ref_logp), 1.0)
+            rel_dev = offset_dev / scale
+
+            rel_err = abs(corrected_logp - ref_logp) / scale
+            if rel_err <= 1e-2:
+                status = "OK"
+            elif rel_dev <= 1e-2:
+                status = "OK (constant offset)"
+            else:
+                status = "MISMATCH"
+
+            report_lines.append(
+                f"{label}: logp BridgeStan={ref_logp:.6f} PyMC={corrected_logp:.6f}"
+                f"{correction_note} diff={diff:.6f} rel_err={rel_err:.2e} "
+                f"offset_dev={rel_dev:.2e} [{status}]"
+            )
+            if status == "MISMATCH":
+                errors.append(
+                    f"{label}: logp mismatch: BridgeStan={ref_logp:.6f}, "
+                    f"PyMC={corrected_logp:.6f}{correction_note}, rel_err={rel_err:.2e}, "
+                    f"offset_dev={rel_dev:.2e} (not a constant offset)"
+                )
+
+        if not errors and abs(mean_diff) > 1e-6:
+            report_lines.append(
+                f"\nNote: constant logp offset of {mean_diff:.6f} detected "
+                f"(normalization constant difference — does not affect posterior)"
+            )
+    elif len(point_results) == 1:
+        label, ref_logp, corrected_logp = point_results[0]
+        rel_err = abs(corrected_logp - ref_logp) / max(abs(ref_logp), 1.0)
+        status = "OK" if rel_err <= 1e-2 else "MISMATCH"
+        correction_note = (
+            f" (Half* corrected, {n_half} dists)"
             if n_half > 0 else ""
         )
         report_lines.append(
@@ -566,6 +619,9 @@ def _tool_validate_model(state: _AgentState, verbose: bool) -> str:
                 f"{label}: logp mismatch: BridgeStan={ref_logp:.6f}, "
                 f"PyMC={corrected_logp:.6f}{correction_note}, rel_err={rel_err:.2e}"
             )
+
+    # Include any evaluation errors as validation errors
+    errors.extend(eval_errors)
 
     report = "\n".join(report_lines)
 
@@ -588,7 +644,7 @@ def _tool_validate_model(state: _AgentState, verbose: bool) -> str:
             "- Check for missing Jacobian terms (PyMC handles these automatically "
             "for built-in transforms, but custom Potentials may need manual adjustment)\n"
             "- BridgeStan uses propto=True, so constant terms may differ — "
-            "a relative error up to 1e-2 is acceptable\n"
+            "a constant offset in logp is acceptable as it does not affect the posterior\n"
             "- NOTE: The validator automatically corrects for the log(2) offset from "
             "Half* distributions (HalfNormal, HalfCauchy, etc.) — you do NOT need to "
             "add manual correction potentials for this.\n"
