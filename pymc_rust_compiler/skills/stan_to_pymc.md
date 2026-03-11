@@ -225,13 +225,147 @@ y = pm.TruncatedNormal("y", mu=mu, sigma=sigma, lower=0)
 | `quad_form(A, b)` | `pt.dot(b.T, pt.dot(A, b))` |
 | `multiply(A, B)` | `A * B` (element-wise) |
 
+## Critical: Half-Distribution log(2) Mismatch (Stan vs PyMC)
+
+**This is the #1 source of logp validation failures when transpiling Stan → PyMC.**
+
+When Stan declares `real<lower=0> sigma; sigma ~ cauchy(0, 5);`, it evaluates the
+**full Cauchy density** on the positive half-line WITHOUT normalizing. PyMC's
+`pm.HalfCauchy('sigma', beta=5)` uses a properly normalized half-distribution that
+adds `log(2)` to the logp (since `pdf_half(x) = 2 * pdf_full(x)` for `x > 0`).
+
+This creates an **exact `log(2)` offset per Half* parameter** in logp comparisons.
+
+### How to handle it
+
+**Option A (recommended for logp validation):** Use the Half distribution and add a
+correction potential:
+
+```python
+n_half_params = 0  # count how many Half* distributions you use
+
+sigma = pm.HalfCauchy("sigma", beta=5)  # Stan: real<lower=0> sigma ~ cauchy(0,5)
+n_half_params += 1
+
+tau = pm.HalfNormal("tau", sigma=1)  # Stan: real<lower=0> tau ~ normal(0,1)
+n_half_params += 1
+
+# Correct the log(2) offset for exact logp match with Stan
+pm.Potential("half_dist_correction", -n_half_params * pt.log(2.0))
+```
+
+**Option B:** Use Gamma/InverseGamma/Exponential distributions that naturally have
+positive support (no `log(2)` issue since they're not "half" versions of symmetric
+distributions).
+
+### Affected patterns
+
+| Stan Pattern | Naive PyMC (WRONG logp) | Corrected PyMC |
+|---|---|---|
+| `real<lower=0> x ~ cauchy(0, s)` | `pm.HalfCauchy(beta=s)` | + correction potential |
+| `real<lower=0> x ~ normal(0, s)` | `pm.HalfNormal(sigma=s)` | + correction potential |
+| `real<lower=0> x ~ student_t(nu, 0, s)` | `pm.HalfStudentT(nu=nu, sigma=s)` | + correction potential |
+| `real<lower=0> x` (no prior) | `pm.HalfFlat()` | + correction potential |
+
+See: https://github.com/pymc-devs/pymc/issues/8186
+
+## Transformed Data Block
+
+Stan's `transformed data` block computes derived quantities from data BEFORE the model.
+These are **constants**, not random variables. The most common mistake is forgetting to
+use the transformed variable as `observed` instead of the raw data.
+
+```stan
+transformed data {
+    vector[N] log_earn;
+    log_earn = log(earn);  // THIS is what gets used as observed
+}
+model {
+    log_earn ~ normal(mu, sigma);  // NOT earn!
+}
+```
+
+```python
+# CORRECT: compute transformation, use as observed
+log_earn = np.log(data['earn'])
+
+with pm.Model() as model:
+    # ...
+    pm.Normal("log_earn", mu=mu, sigma=sigma, observed=log_earn)
+```
+
+## Stan sd() vs NumPy std()
+
+Stan's `sd()` function uses **population standard deviation** (divides by N, equivalent
+to `ddof=0`). NumPy's default `np.std()` also uses `ddof=0`, but be careful not to
+accidentally use `ddof=1`.
+
+```python
+# CORRECT: matches Stan's sd()
+z_height = (height - np.mean(height)) / np.std(height)  # ddof=0, same as Stan
+
+# WRONG: sample std dev, does NOT match Stan
+z_height = (height - np.mean(height)) / np.std(height, ddof=1)
+```
+
+## Indexing: Stan 1-based → Python 0-based
+
+Stan uses 1-based indexing. **All index arrays from posteriordb data are 1-based** and
+must be adjusted with `- 1` when used as Python array indices.
+
+```stan
+// Stan: county is 1-based (values 1..J)
+y[i] ~ normal(alpha[county[i]], sigma);
+```
+
+```python
+# CORRECT: subtract 1 for 0-based indexing
+county_idx = data['county'] - 1  # convert 1-based → 0-based
+pm.Normal("y", mu=alpha[county_idx], sigma=sigma, observed=y)
+```
+
+**Do NOT subtract 1 from size/count variables** like `N`, `J`, `K` — only from index
+arrays that are used for array subscripting.
+
+## Bounded Parameters Without Explicit Prior
+
+When Stan declares `real<lower=0, upper=100> sigma` with NO explicit prior in the model
+block, this is an **implicit uniform prior** on `[0, 100]`.
+
+```python
+# CORRECT
+sigma = pm.Uniform("sigma", lower=0, upper=100)
+
+# WRONG: TruncatedNormal has a non-uniform density shape
+sigma = pm.TruncatedNormal("sigma", mu=50, sigma=1000, lower=0, upper=100)
+```
+
+## Dependent Parameter Bounds
+
+Stan supports bounds that depend on other parameters:
+```stan
+real<lower=0, upper=1> alpha1;
+real<lower=0, upper=(1-alpha1)> beta1;  // upper bound depends on alpha1
+```
+
+PyMC does not directly support dependent bounds. Use a manual transform:
+```python
+alpha1 = pm.Uniform("alpha1", lower=0, upper=1)
+# beta1 lives in (0, 1-alpha1), so use a helper variable in (0,1)
+beta1_raw = pm.Uniform("beta1_raw", lower=0, upper=1)
+beta1 = pm.Deterministic("beta1", beta1_raw * (1 - alpha1))
+# Add Jacobian: log|d(beta1)/d(beta1_raw)| = log(1 - alpha1)
+pm.Potential("beta1_jacobian", pt.log(1 - alpha1))
+```
+
 ## Important Conventions
 
 1. **Indexing**: Stan is 1-based, Python/PyMC is 0-based. Adjust all index arrays.
 2. **Column-major vs row-major**: Stan uses column-major matrices, NumPy uses row-major.
    When converting matrix data, transpose if needed.
 3. **Half distributions**: Stan uses `normal(0, s)` with `<lower=0>` constraint. PyMC has
-   dedicated `pm.HalfNormal`, `pm.HalfCauchy`, etc.
+   dedicated `pm.HalfNormal`, `pm.HalfCauchy`, etc. **BUT they differ by `log(2)` in logp!**
+   See the "Half-Distribution log(2) Mismatch" section above.
 4. **Improper priors**: Stan's `real` with no prior = improper uniform. In PyMC use
    `pm.Flat()` or (better) specify an explicit prior.
 5. **Observed data**: Pass as `observed=` kwarg to the likelihood distribution. Data should
@@ -240,3 +374,8 @@ y = pm.TruncatedNormal("y", mu=mu, sigma=sigma, lower=0)
    `dims=` in distributions for better InferenceData output.
 7. **PyTensor**: PyMC uses PyTensor (formerly Aesara/Theano) for symbolic math. Import as
    `import pytensor.tensor as pt` for operations not directly in `pm.math`.
+8. **Transformed parameters**: Use `pm.Deterministic(...)` or plain pytensor expressions.
+   These are NOT new distributions — do not use `pm.Normal` for a derived quantity like
+   `sigma = sqrt(sigmasq)`.
+9. **binomial_logit**: Stan's `binomial_logit(n, alpha)` = `pm.Binomial("x", n=n, logit_p=alpha)`.
+   Do NOT manually apply `invlogit` — use the `logit_p` parameter directly.
