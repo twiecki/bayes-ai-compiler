@@ -1740,6 +1740,7 @@ test = [
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
+    { name = "ruff" },
 ]
 
 [package.metadata]
@@ -1757,7 +1758,10 @@ requires-dist = [
 provides-extras = ["test", "dev"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=9.0.2" }]
+dev = [
+    { name = "pytest", specifier = ">=9.0.2" },
+    { name = "ruff", specifier = ">=0.15" },
+]
 
 [[package]]
 name = "pymdown-extensions"
