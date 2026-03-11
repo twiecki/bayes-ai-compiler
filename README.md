@@ -1,24 +1,30 @@
-# PyMC Rust AI Compiler
+# Bayes AI Compiler
 
-Compile PyMC models to optimized Rust via LLM. The AI doesn't just translate ops mechanically — it reasons about the full computational graph and applies optimizations a human expert would: loop fusion, memory pre-allocation, cache-friendly access patterns.
+An AI agent that acts as a compiler for Bayesian models. It transpiles between probabilistic programming languages (PyMC, Stan) and compiles to optimized Rust, with numerical validation at every step.
+
+**[Read the blog post →](https://twiecki.io/blog/2026/03/10/pymc-rust-ai-compiler/)**
 
 ## How it works
 
+The agent doesn't translate ops mechanically. It reasons about the full computational graph and applies the optimizations a domain expert would: loop fusion, memory pre-allocation, cache-friendly access patterns.
+
 ```
-PyMC Model → Extract logp graph + validation points → Claude API → Rust code → Verify → Compile
+Source (PyMC/Stan) → Extract logp + validation points → Claude agent loop → Target (Rust/PyMC) → Verify
 ```
 
-1. **Extract**: Read `pm.Model()` to get parameters, transforms, logp graph, and reference values
-2. **Generate**: Claude (as an agent with tools) generates a complete Rust `CpuLogpFunc` implementation
-3. **Verify**: Build and validate logp + gradients against PyMC's reference values
+1. **Extract**: Read model to get parameters, transforms, logp graph, and reference values
+2. **Generate**: Claude (as an agent with tools) generates the target implementation
+3. **Verify**: Validate logp + gradients against reference values
 4. **Iterate**: If validation fails, the agent reads errors, inspects data, and fixes code autonomously
 
-The agent has four tools: `write_rust_code`, `cargo_build`, `validate_logp`, and `read_file`. It loops until the model compiles and validates correctly. Model-specific "skills" are detected automatically and loaded to provide specialized knowledge:
+The agent has four tools: `write_rust_code`, `cargo_build`, `validate_logp`, and `read_file`. It loops until the output compiles and validates correctly. Model-specific "skills" are detected automatically:
 
-- **GP**: CPU linear algebra via faer (Cholesky, solves, inverses)
-- **GP Accelerate**: Apple Accelerate framework (AMX coprocessor) for Apple Silicon
-- **GP CUDA**: GPU-accelerated via cudarc + cuSOLVER for NVIDIA GPUs
+- **GP (CPU)**: Linear algebra via faer (Cholesky, solves, inverses)
+- **GP (Accelerate)**: Apple Accelerate framework (AMX coprocessor) for Apple Silicon
+- **GP (CUDA)**: GPU-accelerated via cudarc + cuSOLVER for NVIDIA GPUs
 - **ZeroSumNormal**: ZeroSum transform formulas and constraint handling
+- **Stan → Rust**: Stan model extraction via BridgeStan
+- **Stan → PyMC**: Distribution mappings, idiom translation, constraint handling
 
 Hardware is auto-detected: CUDA → Accelerate (Apple Silicon) → CPU fallback.
 
@@ -57,6 +63,7 @@ For GP models on Apple Silicon, the compiler auto-detects the platform and uses 
 | Rust + Accelerate (AMX) | 366 | **1.33x** |
 
 No extra crate dependencies needed — Accelerate is linked via `build.rs` to the system framework.
+
 ## Quick start
 
 ```bash
@@ -92,6 +99,10 @@ python examples/run_benchmark.py
 
 # logp+dlogp evaluation benchmark (Rust vs nutpie/Numba)
 python examples/bench_logp.py
+
+# Stan → PyMC transpilation
+python examples/stan_pymc_01_normal.py
+python examples/stan_pymc_02_hierarchical.py
 ```
 
 ## Architecture
@@ -100,17 +111,39 @@ python examples/bench_logp.py
 pymc_rust_compiler/
 ├── exporter.py       # Extract parameters, transforms, logp graph from pm.Model()
 ├── compiler.py       # Agentic loop: Claude API → Rust code → build → validate
+├── stan_exporter.py  # Extract Stan model context via BridgeStan
+├── stan_compiler.py  # Stan → Rust agentic compiler
+├── stan_to_pymc.py   # Stan → PyMC agentic transpiler
 ├── nutpie_bridge.py  # nutpie integration: compiled Rust → nutpie.sample()
 ├── benchmark.py      # logp eval benchmarks: Rust vs Numba (jit + cfunc)
 └── skills/           # Model-specific knowledge for the AI agent
     ├── gp.md              # CPU GP (faer Cholesky)
     ├── gp_accelerate.md   # Apple Silicon GP (Accelerate LAPACK / AMX)
     ├── gp_cuda.md         # NVIDIA GPU GP (cudarc + cuSOLVER)
-    └── zerosumnormal.md
+    ├── zerosumnormal.md
+    ├── stan.md            # Stan → Rust translation knowledge
+    └── stan_to_pymc.md    # Stan → PyMC translation knowledge
 
 rust_template/      # Template Rust project (Cargo.toml, data loading, validation)
 bench_runner/       # Rust lib for calling Numba cfunc from Rust (like nutpie)
 compiled_models/    # Pre-compiled models (normal, linreg, hierarchical, GP, ...)
 ```
 
-The key insight: `pm.Model()` already contains everything needed — parameters, transforms, shapes, logp functions. We extract it all and let the AI generate optimized Rust that matches PyMC's exact numerical output.
+## Stan → PyMC Transpiler
+
+The same agentic architecture works for language-to-language translation. Claude generates PyMC code, validates logp against BridgeStan reference values, and iterates until the models match numerically. Used to translate all 120 models from [posteriordb](https://github.com/stan-dev/posteriordb) from Stan to PyMC.
+
+```python
+from pymc_rust_compiler import transpile_stan_to_pymc
+
+stan_code = """
+data { int<lower=0> N; array[N] real y; }
+parameters { real mu; real<lower=0> sigma; }
+model { mu ~ normal(0, 10); sigma ~ normal(0, 5); y ~ normal(mu, sigma); }
+"""
+
+result = transpile_stan_to_pymc(stan_code, data={"N": 100, "y": [...]})
+if result.success:
+    model = result.get_model(data)  # returns a pm.Model
+    print(result.pymc_code)         # generated Python code
+```

@@ -10,6 +10,7 @@ dependencies = [
     "anthropic>=0.52",
     "numpy",
     "marimo>=0.20.4",
+    "bridgestan>=2.7.0",
 ]
 
 [project.optional-dependencies]
@@ -22,3 +23,8 @@ requires = ["hatchling"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["pymc_rust_compiler"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
