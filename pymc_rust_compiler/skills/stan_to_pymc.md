@@ -584,32 +584,19 @@ with pm.Model(coords=coords) as model:
     pm.Normal("y", mu=alpha[county_idx], sigma=sigma_y, observed=y_data, dims="obs")
 ```
 
-### Coords and Data are mutable by default
-
-Coords and `pm.Data` are **mutable by default** in PyMC — there is no need to pass
-`mutable=True`. You can resize coords and swap data for out-of-sample prediction
-without any special flags:
-
-```python
-with pm.Model(coords={"obs": np.arange(N_train)}) as model:
-    X = pm.Data("X", X_train, dims=("obs", "predictor"))
-    # ...
-
-# Later, for prediction — just set new data and coords:
-pm.set_data({"X": X_test}, coords={"obs": np.arange(N_test)})
-```
-
 ### Freezing coords and data with `freeze_dims_and_data`
 
-If you want to freeze existing mutable coords and data (e.g., to simplify the
-computation graph or generate more efficient compiled code), use:
+To freeze mutable coords and data (e.g., to simplify the computation graph or generate
+more efficient compiled code), use the standalone function:
 
 ```python
-model.freeze_dims_and_data()
+from pymc.model.transform.optimization import freeze_dims_and_data
+
+frozen_model = freeze_dims_and_data(model)
 ```
 
-This converts all mutable coords and data containers into fixed constants, which can
-enable additional graph optimizations.
+This returns a new model where all mutable coords and data containers are replaced with
+fixed constants, enabling additional graph optimizations.
 
 ### Always use `dims`, never `shape`
 
