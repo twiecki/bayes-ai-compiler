@@ -584,26 +584,26 @@ with pm.Model(coords=coords) as model:
     pm.Normal("y", mu=alpha[county_idx], sigma=sigma_y, observed=y_data, dims="obs")
 ```
 
-### Mutable coords for varying-size data
+### Freezing coords and data with `freeze_dims_and_data`
 
-When a dimension might change size (e.g., for out-of-sample prediction), use
-`model.add_coord` with `mutable=True`:
+To freeze mutable coords and data (e.g., to simplify the computation graph or generate
+more efficient compiled code), use the standalone function:
 
 ```python
-with pm.Model() as model:
-    model.add_coord("obs", np.arange(N_train), mutable=True)
-    # ...
-    # Later, for prediction:
-    pm.set_data({"X": X_test}, coords={"obs": np.arange(N_test)})
+from pymc.model.transform.optimization import freeze_dims_and_data
+
+frozen_model = freeze_dims_and_data(model)
 ```
 
-### When to use `shape` vs `dims`
+This returns a new model where all mutable coords and data containers are replaced with
+fixed constants, enabling additional graph optimizations.
 
-- **Prefer `dims`** for any parameter or observed variable with a meaningful semantic axis
-  (groups, predictors, time steps, categories, etc.)
-- **Fall back to `shape`** only for internal helper variables where naming adds no clarity
-- **Use `dims` on `pm.Deterministic` too** — transformed parameters benefit from labeled
-  axes just as much as priors do
+### Always use `dims`, never `shape`
+
+- **Always use `dims`** for every parameter, observed variable, and `pm.Deterministic`.
+  `shape` is never needed — `dims` provides the same sizing while adding labeled axes.
+- Named dims produce cleaner InferenceData, better ArviZ plots, and catch shape
+  mismatches earlier.
 
 ## Important Conventions
 
